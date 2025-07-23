@@ -1,26 +1,28 @@
+# -*- coding: utf-8 -*-
+"""
+电信客户流失预测模型 (生产级脚本)
+
+功能:
+1.  环境自检与自动安装依赖库。
+2.  从CSV文件加载真实的电信客户数据。
+3.  进行健壮的数据清洗和预处理。
+4.  使用Spark MLlib Pipeline构建、训练和评估逻辑回归模型。
+5.  输出详细的模型评估报告。
+"""
+
 # --- 0. 环境自检与自动安装 ---
-# 在执行任何操作前，先检查所有必需的库是否已安装。
 import sys
 import subprocess
 import importlib
 import os
-import sys
 
-# 确保 Spark 知道使用哪个 Python 解释器
-# sys.executable 会自动获取当前虚拟环境中 python.exe 的绝对路径
+# 终极修复：在创建SparkSession之前，强制设置Python环境
+# 这能确保Spark在任何环境下都能找到正确的Python解释器
 os.environ['PYSPARK_PYTHON'] = sys.executable
 os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
 def check_and_install_libraries(required_libraries):
-    """
-    检查指定的Python库是否已安装，如果未安装则尝试使用pip自动安装。
-
-    参数:
-    required_libraries (dict): 一个字典，键是pip安装时的包名，值是import时使用的模块名。
-
-    返回:
-    bool: 如果所有库都已就绪，返回True，否则在尝试安装后返回False并退出程序。
-    """
+    """检查并安装所有必需的库。"""
     missing_packages = []
     for package_name, import_name in required_libraries.items():
         try:
@@ -33,101 +35,82 @@ def check_and_install_libraries(required_libraries):
     if missing_packages:
         print("\n正在尝试自动安装缺失的库...")
         try:
-            # 使用 sys.executable 确保pip命令在当前Python环境中执行
             subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + missing_packages)
-            print("\n所有缺失的库已成功安装！")
-            print("请重新运行此脚本以加载新安装的库。")
+            print("\n所有缺失的库已成功安装！请重新运行此脚本。")
         except subprocess.CalledProcessError:
-            print("\n错误：自动安装失败。")
-            print("请在你的终端中手动运行以下命令:")
-            print(f"pip install {' '.join(missing_packages)}")
-
-        # 退出程序，让用户重新运行以加载新库
+            print(f"\n错误：自动安装失败。请手动运行: pip install {' '.join(missing_packages)}")
         sys.exit(1)
-
     print("\n所有依赖库均已满足，开始执行主程序...\n")
-    return True
 
-
-# 定义项目需要的库 (pip包名 -> import名)
+# 定义项目需要的库
 REQUIRED_LIBRARIES = {
     'pyspark': 'pyspark',
     'pandas': 'pandas',
     'numpy': 'numpy',
     'scikit-learn': 'sklearn'
 }
-
-# 执行检查
 check_and_install_libraries(REQUIRED_LIBRARIES)
 
+
 # --- 1. 导入所有必要的库 ---
-# Spark相关的库，用于分布式计算
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when
+from pyspark.sql.functions import col, when, trim
+from pyspark.sql.types import DoubleType
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, Imputer
 from pyspark.ml.classification import LogisticRegression
-
-# 数据处理和数值计算库
 import pandas as pd
-import numpy as np
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
 
-# 模型评估相关的库
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 # --- 2. 初始化Spark Session ---
-# SparkSession是所有Spark操作的入口点
+# 使用 .config("spark.driver.host", "127.0.0.1") 避免潜在的网络问题
 spark = SparkSession.builder \
-    .appName("TelcoChurnPrediction") \
+    .appName("TelcoChurnPrediction_RealData") \
+    .config("spark.driver.host", "127.0.0.1") \
     .getOrCreate()
 
-# --- 3. 数据模拟与加载 ---
-# 为了项目的可复现性，我们在这里模拟生成一个结构与真实Telco Churn数据集类似的DataFrame。
-# 在实际项目中，这一步通常是 spark.read.csv() 或 spark.read.parquet()。
-n_customers = 7043
-np.random.seed(42)  # 使用固定的随机种子保证每次生成的数据一致
 
-# 模拟生成分类特征
-contract = np.random.choice(['Month-to-month', 'One year', 'Two year'], size=n_customers, p=[0.55, 0.21, 0.24])
-payment_method = np.random.choice(
-    ['Electronic check', 'Mailed check', 'Bank transfer (automatic)', 'Credit card (automatic)'], n_customers)
+# --- 3. 数据加载与初步清洗 (使用真实数据) ---
+# 定义数据路径，请确保数据集文件位于此路径
+DATA_PATH = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
 
-# 模拟生成数值特征
-tenure = np.random.randint(1, 73, n_customers)
-monthly_charges = np.random.normal(64.76, 30.09, n_customers).clip(18.25, 118.75)
-total_charges = (tenure * monthly_charges + np.random.normal(0, 200, n_customers)).clip(18.8)
+try:
+    df = spark.read.csv(DATA_PATH, header=True, inferSchema=True)
+    print(f"--- 成功从 '{DATA_PATH}' 加载数据 ---")
+except Exception as e:
+    print(f"错误: 无法在路径 '{DATA_PATH}' 找到或读取数据。")
+    print("请确保您已下载 'WA_Fn-UseC_-Telco-Customer-Churn.csv' 文件，并将其放置在与脚本相同的目录中。")
+    print(f"详细错误: {e}")
+    spark.stop()
+    sys.exit(1)
 
-# 模拟生成目标变量 (Churn)，并使其与部分特征相关
-churn_prob = 1 / (1 + np.exp(-(-2.0 + (contract == 'Month-to-month') * 1.0 - tenure * 0.03 + monthly_charges * 0.01)))
-churn_label = np.random.binomial(1, churn_prob, n_customers)
-churn = np.array(['Yes' if c == 1 else 'No' for c in churn_label])
-
-# 模拟生成缺失值
-total_charges[np.random.choice(n_customers, 11, replace=False)] = np.nan
-
-# 使用Pandas创建本地DataFrame，然后转换为Spark DataFrame
-pd_df = pd.DataFrame({
-    'Contract': contract, 'PaymentMethod': payment_method,
-    'tenure': tenure, 'MonthlyCharges': monthly_charges, 'TotalCharges': total_charges,
-    'Churn': churn
-})
-df = spark.createDataFrame(pd_df)
+# 数据清洗: TotalCharges列可能包含空格，导致类型推断错误
+# 我们需要手动将其转换成数值类型，空格会被转换成null
+df = df.withColumn("TotalCharges", col("TotalCharges").cast(DoubleType()))
 
 print("--- 原始数据样本 ---")
-df.show(5)
+df.show(5, truncate=False)
+df.printSchema()
+
 
 # --- 4. 特征工程与数据预处理 ---
 # a. 将目标变量 'Churn' 从字符串 (Yes/No) 转换为数值 (1/0)
 df = df.withColumn("label", when(col("Churn") == "Yes", 1).otherwise(0))
 
 # b. 识别需要处理的特征列
-categorical_cols = ['Contract', 'PaymentMethod']
+# 我们从原始数据中选择一些有代表性的特征
+categorical_cols = ['gender', 'Partner', 'Dependents', 'PhoneService', 'MultipleLines',
+                    'InternetService', 'OnlineSecurity', 'OnlineBackup', 'DeviceProtection',
+                    'TechSupport', 'StreamingTV', 'StreamingMovies', 'Contract',
+                    'PaperlessBilling', 'PaymentMethod']
 numeric_cols = ['tenure', 'MonthlyCharges', 'TotalCharges']
 
 # c. 创建特征处理流水线 (Pipeline)
 stages = []
 
 # c1. 处理数值列的缺失值：使用中位数进行填充
+# TotalCharges列在清洗后可能存在null值
 imputer = Imputer(
     inputCols=["TotalCharges"],
     outputCols=["TotalCharges_imputed"]
@@ -141,9 +124,11 @@ for col_name in categorical_cols:
     stages += [string_indexer, encoder]
 
 # c3. 将所有处理好的特征合并成一个向量
+# 注意：我们使用填充后的 'TotalCharges_imputed'
 assembler_inputs = [c + "_vec" for c in categorical_cols] + ['tenure', 'MonthlyCharges', 'TotalCharges_imputed']
 assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
 stages.append(assembler)
+
 
 # --- 5. 建立模型、训练与预测 ---
 # a. 建立逻辑回归模型
@@ -154,13 +139,16 @@ stages.append(lr)  # 将模型作为流水线的最后一步
 pipeline = Pipeline(stages=stages)
 
 # c. 划分训练集和测试集 (80%用于训练, 20%用于测试)
-(train_data, test_data) = df.randomSplit([0.8, 0.2], seed=42)
+(train_data, test_data) = df.randomSplit([0.8, 0.2], seed=1234)
 
-# d. 训练模型：Pipeline会依次执行所有定义的步骤
+# d. 训练模型
+print("\n--- 开始训练模型 ---")
 model = pipeline.fit(train_data)
+print("--- 模型训练完成 ---")
 
 # e. 在测试集上进行预测
 predictions = model.transform(test_data)
+
 
 # --- 6. 模型评估 ---
 # 将Spark DataFrame转换为Pandas DataFrame以便使用scikit-learn进行评估
@@ -172,32 +160,37 @@ cm = confusion_matrix(preds_and_labels['label'], preds_and_labels['prediction'],
 tn, fp, fn, tp = cm.ravel()
 
 # 计算核心评估指标
-# zero_division=0: 当分母为0时（例如模型从未预测某个类别），将结果设为0而不是报错
+accuracy = accuracy_score(preds_and_labels['label'], preds_and_labels['prediction'])
 precision = precision_score(preds_and_labels['label'], preds_and_labels['prediction'], labels=labels, zero_division=0)
 recall = recall_score(preds_and_labels['label'], preds_and_labels['prediction'], labels=labels, zero_division=0)
 f1 = f1_score(preds_and_labels['label'], preds_and_labels['prediction'], labels=labels, zero_division=0)
 
 print("\n--- 模型评估报告 ---")
-print(f"True Positives (TP): {tp}")
-print(f"True Negatives (TN): {tn}")
+print(f"True Positives (TP) : {tp}")
+print(f"True Negatives (TN) : {tn}")
 print(f"False Positives (FP): {fp}")
 print(f"False Negatives (FN): {fn}")
 print("-" * 25)
-print(f"Precision: {precision:.2f}")
-print(f"Recall:    {recall:.2f}")
-print(f"F1 Score:  {f1:.2f}")
+print(f"Accuracy : {accuracy:.2%}")
+print(f"Precision: {precision:.2%}")
+print(f"Recall   : {recall:.2%}")
+print(f"F1 Score : {f1:.2%}")
 
-# --- 7. 导出评估结果，用于后续可视化 ---
+
+# --- 7. 导出评估结果 ---
+# 定义输出目录
+output_dir = "churn_model_report"
 report_data = {
-    'Metric': ['TP', 'TN', 'FP', 'FN', 'Precision', 'Recall', 'F1 Score'],
-    'Value': [int(tp), int(tn), int(fp), int(fn), precision, recall, f1]
+    'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'TP', 'TN', 'FP', 'FN'],
+    'Value': [accuracy, precision, recall, f1, int(tp), int(tn), int(fp), int(fn)]
 }
 report_df = pd.DataFrame(report_data)
-# 将Pandas DataFrame转回Spark DataFrame以便使用Spark的写入功能
 spark_report_df = spark.createDataFrame(report_df)
-spark_report_df.coalesce(1).write.option("header", "true").mode("overwrite").csv("churn_model_report_professional")
+spark_report_df.coalesce(1).write.option("header", "true").mode("overwrite").csv(output_dir)
 
-print("\n模型评估报告已成功保存至 'churn_model_report_professional' 文件夹。")
+print(f"\n模型评估报告已成功保存至 '{output_dir}' 文件夹。")
+
 
 # --- 8. 停止Spark Session，释放资源 ---
 spark.stop()
+print("\nSpark Session已成功停止。")
